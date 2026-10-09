@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# Launch Garmin Aviation Database Manager (the Windows app) under Wine,
+# with a removable SD card mapped to a Wine drive.
+#
+# Environment (current values are the defaults):
+#   WINEPREFIX   Wine prefix that has GADM installed (default: ~/garmin-gadm)
+#   GADM_DRIVE   Drive letter GADM should see (default: g)
+#
+# The card is mounted with udisksctl when it is not already mounted, then
+# exposed as dosdevices/<letter>: (mountpoint) and <letter>:: (raw device).
+# Wine is told that drive is removable. A log is appended to
+# ~/.cache/gadm-launch.log.
+#
+# Dialogs use kdialog (KDE). On GNOME, install the kdialog package.
+
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "gadm must be run with bash." >&2
+  exit 1
+fi
+
+set -u
+
+export WINEPREFIX="${WINEPREFIX:-${HOME}/garmin-gadm}"
+GADM_DRIVE="${GADM_DRIVE:-g}"
+LETTER="${GADM_DRIVE,,}"
+APP_DIR="${WINEPREFIX}/drive_c/Program Files (x86)/Garmin/Garmin Aviation Database Manager"
+EXE="Garmin Aviation Database Manager.exe"
+LOG="${HOME}/.cache/gadm-launch.log"
+
+mkdir -p "$(dirname "${LOG}")"
+
+log() {
+  printf '%s %s\n' "$(date --iso-8601=seconds)" "$*" >>"${LOG}"
+}
+
+die_dialog() {
+  local message="$1"
+  echo "${message}" >&2
+  log "error: ${message}"
+  if command -v kdialog >/dev/null 2>&1; then
+    kdialog --title "Garmin Database Manager" --error "${message}" || true
+  fi
+  exit 1
+}
+
+if [[ ! "${LETTER}" =~ ^[a-z]$ ]]; then
+  die_dialog "GADM_DRIVE must be a single letter a-z (got: ${GADM_DRIVE})."
+fi
+if [[ "${LETTER}" == "c" || "${LETTER}" == "z" ]]; then
+  die_dialog "GADM_DRIVE=${LETTER} is reserved by Wine. C: is the Windows system drive and Z: is the Linux filesystem. Pick another letter (the default is G:)."
+fi
+
+missing=()
+command -v kdialog >/dev/null 2>&1 || missing+=("kdialog")
+command -v udisksctl >/dev/null 2>&1 || missing+=("udisksctl")
+command -v wine >/dev/null 2>&1 || missing+=("wine")
+command -v lsblk >/dev/null 2>&1 || missing+=("lsblk")
+if ((${#missing[@]} > 0)); then
+  printf 'Missing required program(s): %s\n' "${missing[*]}" >&2
+  echo "Install them (see README.md), then start the launcher again." >&2
+  exit 1
+fi
+
+DRIVE_LABEL="${LETTER^^}:"
+
+# Print one lsblk -P field. lsblk hex-escapes unsafe bytes as \xNN.
+lsblk_field() {
+  local line="$1"
+  local key="$2"
+  local raw=""
+  local re
+  re='(^| )'"${key}"'="([^"]*)"'
+  if [[ "${line}" =~ ${re} ]]; then
+    raw="${BASH_REMATCH[2]}"
+  fi
+  printf '%b' "${raw}"
+}
+
+# Removable/SD partitions: lines of "DEVICE<TAB>MOUNTPOINT" (mountpoint may be empty).
+list_cards() {
+  local line name rm hotplug type fstype mountpoint
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    name="$(lsblk_field "${line}" NAME)"
+    rm="$(lsblk_field "${line}" RM)"
+    hotplug="$(lsblk_field "${line}" HOTPLUG)"
+    type="$(lsblk_field "${line}" TYPE)"
+    fstype="$(lsblk_field "${line}" FSTYPE)"
+    mountpoint="$(lsblk_field "${line}" MOUNTPOINT)"
+    [[ "${type}" == "part" || "${type}" == "disk" ]] || continue
+    [[ -n "${fstype}" ]] || continue
+    if [[ "${rm}" == "1" || "${hotplug}" == "1" || "${name}" == /dev/mmcblk* ]]; then
+      printf '%s\t%s\n' "${name}" "${mountpoint}"
+    fi
+  done < <(lsblk -Ppno NAME,RM,HOTPLUG,TYPE,FSTYPE,MOUNTPOINT)
+}
+
+# Mount any unmounted card partitions, then print the first "dev<TAB>mountpoint".
+find_card() {
+  local dev mnt
+  while IFS=$'\t' read -r dev mnt; do
+    if [[ -z "${mnt}" ]]; then
+      udisksctl mount -b "${dev}" --no-user-interaction >>"${LOG}" 2>&1 || true
+    fi
+  done < <(list_cards)
+  list_cards | awk -F '\t' '$2 != "" { print; exit }'
+}
+
+CARD=""
+while :; do
+  CARD="$(find_card)"
+  [[ -n "${CARD}" ]] && break
+  kdialog --title "Garmin Database Manager" \
+    --yes-label "Try again" --no-label "Open without card" \
+    --warningyesnocancel "No SD card found.\n\nInsert the SD card and click Try again."
+  case $? in
+    0) sleep 2; continue ;;
+    1) break ;;
+    *) exit 0 ;;
+  esac
+done
+
+DEV="${CARD%%$'\t'*}"
+MNT="${CARD#*$'\t'}"
+
+if [[ ! -d "${WINEPREFIX}/dosdevices" ]]; then
+  die_dialog "Wine prefix is missing or incomplete:
+
+${WINEPREFIX}
+
+Create the prefix and install Garmin Aviation Database Manager before using this launcher."
+fi
+
+if [[ ! -f "${APP_DIR}/${EXE}" ]]; then
+  die_dialog "GADM not found in ${APP_DIR}"
+fi
+
+if [[ -n "${CARD}" ]]; then
+  SIZE="$(lsblk -dno SIZE "${DEV}" | tr -d ' ')"
+  SIZE="${SIZE:-unknown}"
+  kdialog --title "Garmin Database Manager" \
+    --yes-label "Start" --no-label "Cancel" \
+    --yesno "SD card connected (${SIZE}, ${DEV}).\n\nIt will show up as drive ${DRIVE_LABEL} in Database Manager.\n\nStart now?" || exit 0
+fi
+
+link_path() {
+  local link="$1"
+  if [[ -L "${link}" || ! -e "${link}" ]]; then
+    rm -f "${link}"
+    return 0
+  fi
+  die_dialog "${link} exists and is not a symlink. Refusing to replace it."
+}
+
+link_path "${WINEPREFIX}/dosdevices/${LETTER}:"
+link_path "${WINEPREFIX}/dosdevices/${LETTER}::"
+
+if [[ -n "${CARD}" ]]; then
+  ln -s "${MNT}" "${WINEPREFIX}/dosdevices/${LETTER}:"
+  ln -s "${DEV}" "${WINEPREFIX}/dosdevices/${LETTER}::"
+  # "floppy" is Wine's drive type for removable media (DRIVE_REMOVABLE).
+  wine reg add 'HKLM\Software\Wine\Drives' /v "${LETTER}:" /d floppy /f >>"${LOG}" 2>&1 || true
+  log "card ${DEV} at ${MNT} mapped to ${DRIVE_LABEL}"
+else
+  log "starting without an SD card; ${DRIVE_LABEL} left unmapped"
+fi
+
+log "starting ${EXE}"
+cd "${APP_DIR}" || exit 1
+wine "${EXE}" >>"${LOG}" 2>&1 || status=$?
+status="${status:-0}"
+log "exited with status ${status}"
+
+# Offer to eject once the app closes.
+if [[ -n "${CARD}" ]] && findmnt -rn "${MNT}" >/dev/null; then
+  sync
+  if kdialog --title "Garmin Database Manager" --yesno "Safely eject the SD card now?"; then
+    if udisksctl unmount -b "${DEV}" >>"${LOG}" 2>&1; then
+      if udisksctl power-off -b "${DEV}" >>"${LOG}" 2>&1; then
+        notify-send "SD card ejected" "You can remove it now." 2>/dev/null || true
+        log "ejected ${DEV}"
+      else
+        notify-send "SD card unmounted" "Unmounted ${DEV}, but power-off failed. You can remove it if it is idle." 2>/dev/null || true
+        log "unmounted ${DEV}; power-off failed"
+      fi
+    else
+      log "unmount failed for ${DEV}"
+      kdialog --title "Garmin Database Manager" --error "Could not unmount ${DEV}. Close anything still using the card and eject it from the file manager." || true
+    fi
+  fi
+fi

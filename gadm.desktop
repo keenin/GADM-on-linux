@@ -1,0 +1,15 @@
+# Template for the application menu. install.sh replaces every @HOME@
+# with the installing user's home directory. Desktop entries do not expand ~.
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Garmin Aviation Database Manager
+GenericName=Aviation database updater
+Comment=Update Garmin aviation databases on an SD card (Windows app under Wine)
+Exec="@HOME@/.local/bin/gadm"
+TryExec=@HOME@/.local/bin/gadm
+Icon=drive-removable-media
+Terminal=false
+Categories=Utility;
+Keywords=Garmin;aviation;database;SD card;
+StartupNotify=true
