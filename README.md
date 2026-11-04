@@ -24,13 +24,15 @@ The dialogs use `kdialog`, which is part of that Plasma desktop. The same `kdial
 2. If a candidate is not mounted, it mounts it with `udisksctl mount --no-user-interaction`.
 3. If nothing mounted is found, a dialog says **No SD card found** and offers **Try again**, **Open without card**, or cancel (which quits).
 4. When a card is found, a dialog shows its size and device node and asks you to **Start** or **Cancel**.
-5. It points Wine drive `G:` at that card: `dosdevices/g:` is a symlink to the mountpoint, and `dosdevices/g::` is a symlink to the raw device. It also sets the Wine registry value `HKLM\Software\Wine\Drives` / `g:` to `floppy`. In Wine, `floppy` means a removable drive, which is how Database Manager recognizes a card.
-6. It starts `Garmin Aviation Database Manager.exe` from the prefix, with that directory as the working directory.
+5. It points Wine drive `A:` at that card. `dosdevices/a:` is a symlink to the mountpoint. There is no `a::` symlink to the raw device. It sets the Wine registry value `HKLM\Software\Wine\Drives` / `a:` to `floppy`, then runs `wineserver -k` and `wineserver -w`. Mountmgr reads drive types only at startup, and it honors `floppy` (DRIVE_REMOVABLE) for `A:` and `B:` only. `C:` and later are downgraded to a fixed disk, which Database Manager ignores.
+6. It starts `Garmin Aviation Database Manager.exe` from the prefix, with that directory as the working directory. That start is a new wineserver, so it sees the `floppy` value.
 7. After the app exits, if the card is still mounted, it asks whether to eject. Eject unmounts the partition with `udisksctl` and then powers the device off. A desktop notification is shown when that succeeds.
 
 A log is appended to `~/.cache/gadm-launch.log`.
 
-Opening without a card still starts Database Manager, and clears the `G:` mapping so a stale card is not left behind.
+Wine's udisks2 support may also auto-create another letter for the same card, often `H:`. That letter is a fixed disk. In Database Manager, use `A:` and ignore the extra one.
+
+Opening without a card still starts Database Manager, and clears the `A:` mapping so a stale card is not left behind. Restarting wineserver closes any other Wine programs that use this prefix.
 
 ## Prerequisites
 
@@ -110,7 +112,7 @@ Finish the installer normally. When it is done, this file should exist:
 ~/garmin-gadm/drive_c/Program Files (x86)/Garmin/Garmin Aviation Database Manager/Garmin Aviation Database Manager.exe
 ```
 
-The launcher looks for that path. If the installer offers to launch the app immediately, you can close it; the card will not be mapped to `G:` until you use `gadm`.
+The launcher looks for that path. If the installer offers to launch the app immediately, you can close it; the card will not be mapped to `A:` until you use `gadm`.
 
 ### 3. Install the launcher
 
@@ -136,7 +138,7 @@ Log out and back in if a terminal cannot find `gadm`. Many desktops add `~/.loca
 1. Insert the aviation SD card into the reader. Wait a moment so the kernel sees it.
 2. Open **Garmin Aviation Database Manager** from the application menu, or run `~/.local/bin/gadm`.
 3. If the card is detected, confirm the popup. It shows the size and the device (for example `59.5G, /dev/sdb1`). Choose **Start**.
-4. In Database Manager the card appears as drive **G:**. Update databases the way you would on Windows.
+4. In Database Manager the card appears as drive **A:**. Wine may also list the same card as another letter, often **H:**. Ignore that one and select **A:**. Update databases the way you would on Windows.
 5. Quit Database Manager. The launcher then asks **Safely eject the SD card now?** Choose yes to unmount and power off. When the notification says the card was ejected, remove it.
 
 If the card is not in the reader yet, the **No SD card found** dialog can **Try again** after you insert it, or **Open without card** when you only need the app itself (account, calendar, downloads). Cancel closes the launcher and does not start Wine.
@@ -148,20 +150,20 @@ If the card is not in the reader yet, the **No SD card found** dialog can **Try 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `WINEPREFIX` | `~/garmin-gadm` | Prefix that contains the GADM install |
-| `GADM_DRIVE` | `g` | Drive letter Database Manager should see |
+| `GADM_DRIVE` | `a` | Drive letter Database Manager should see. Only `a` and `b` are reported as removable. |
 
-The menu entry uses the defaults. From a terminal:
+The menu entry uses the defaults. `B:` is the other letter Wine will report as removable:
 
 ```bash
-GADM_DRIVE=h ~/.local/bin/gadm
+GADM_DRIVE=b ~/.local/bin/gadm
 ```
 
-`C:` and `Z:` are rejected. Wine uses `C:` for the prefix and `Z:` for the Linux filesystem.
+Any other letter is logged and shown in a warning dialog. Database Manager will not see that drive. `C:` and `Z:` are rejected. Wine uses `C:` for the prefix and `Z:` for the Linux filesystem.
 
 To change the menu entry, edit `~/.local/share/applications/gadm.desktop` and set `Exec` to something like:
 
 ```ini
-Exec=env GADM_DRIVE=h /home/you/.local/bin/gadm
+Exec=env GADM_DRIVE=b /home/you/.local/bin/gadm
 ```
 
 Then run `update-desktop-database ~/.local/share/applications` or log out and back in.
@@ -211,7 +213,48 @@ If that succeeds, start the launcher again. If several removable devices are plu
 
 If the reader never shows `RM`, `HOTPLUG`, or `mmcblk`, the script will keep skipping it. That is visible in the `lsblk` columns above.
 
+### Database Manager does not see the card
+
+The start dialog can confirm the card while Database Manager still shows no removable drive. GADM's native core (`AvdbUpdaterCore.dll`) enumerates drives with `GetLogicalDrives` and `GetDriveTypeW` and only accepts `DRIVE_REMOVABLE`.
+
+On Wine 10.0, mountmgr honors the registry type `floppy` only for **A:** and **B:**. For **C:** and later it silently downgrades the drive to a hard disk, so a card mapped to `G:` comes back as DriveType 3 (fixed) and GADM ignores it. Wine's udisks2 automount does the same: it may create **H:** for the card, and that letter is also DriveType 3. Ignore `H:` (or whichever extra letter appears) and use **A:**.
+
+The mapping that works is:
+
+- `dosdevices/a:` points at the card mountpoint
+- `dosdevices/a::` does not exist (a raw-device symlink made mountmgr treat `A:` oddly)
+- `HKLM\Software\Wine\Drives` value `a:` is `floppy`
+- wineserver was restarted after that write, so mountmgr read it at startup
+
+A non-root user cannot read `/dev/sdX`. With a raw-device symlink in place, Wine may report NTFS or a bogus volume serial. That did not stop GADM once `A:` was actually removable, and the launcher does not create `a::`.
+
+Check the types Wine is reporting, with this prefix:
+
+```bash
+export WINEPREFIX="$HOME/garmin-gadm"
+wine wmic logicaldisk get name,drivetype
+```
+
+DriveType 2 means removable. `A:` should be 2. A duplicate letter (often `H:`) may be 3; ignore it inside Database Manager.
+
+If `A:` is not 2, confirm the registry value and that the raw-device symlink is absent:
+
+```bash
+WINEPREFIX="$HOME/garmin-gadm" wine reg query 'HKLM\Software\Wine\Drives' /v a:
+ls -l "$WINEPREFIX/dosdevices/a:" "$WINEPREFIX/dosdevices/a::"
+```
+
+`a:` should be `floppy` and should point at the mountpoint (often under `/media` or `/run/media`). `a::` should be missing (`ls` will say so). Start the launcher again so it rewrites the registry and restarts wineserver.
+
+An older copy of this launcher mapped the card to `G:`. Those links are not used anymore:
+
+```bash
+rm -f "$WINEPREFIX/dosdevices/g:" "$WINEPREFIX/dosdevices/g::"
+```
+
 ### The app is already running
+
+Each launch with a card runs `wineserver -k` in this prefix before Database Manager starts, so mountmgr reloads drive types. That also closes every other Wine program using `~/garmin-gadm`.
 
 Database Manager, or a Wine process left behind from a previous launch, can refuse a second start or can hold the card open so eject fails. This only affects programs inside the GADM prefix:
 
@@ -249,10 +292,10 @@ Launcher output, Wine output, and the `reg add` that marks the drive removable a
 Confirm the drive mapping after a start, while the app is still open:
 
 ```bash
-ls -l "$WINEPREFIX/dosdevices/g:" "$WINEPREFIX/dosdevices/g::"
+ls -l "$WINEPREFIX/dosdevices/a:"
 ```
 
-`g:` should point at the card's mountpoint (often under `/media` or `/run/media`), and `g::` should point at the device node.
+`a:` should point at the card's mountpoint (often under `/media` or `/run/media`). There should be no `a::`. Drive types are covered in [Database Manager does not see the card](#database-manager-does-not-see-the-card).
 
 ## Files
 

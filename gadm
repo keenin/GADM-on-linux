@@ -4,12 +4,20 @@
 #
 # Environment (current values are the defaults):
 #   WINEPREFIX   Wine prefix that has GADM installed (default: ~/garmin-gadm)
-#   GADM_DRIVE   Drive letter GADM should see (default: g)
+#   GADM_DRIVE   Drive letter GADM should see (default: a)
+#
+# The default letter is A: on purpose. GADM's AvdbUpdaterCore.dll enumerates
+# drives with GetLogicalDrives and GetDriveTypeW and accepts only
+# DRIVE_REMOVABLE. Wine's mountmgr honors HKLM\Software\Wine\Drives value
+# "floppy" for A: and B: only. C: and later are silently downgraded to a
+# fixed disk (DriveType 3), which GADM ignores. Wine's udisks2 auto-mapping
+# (often H:) is also a fixed disk and can be ignored.
 #
 # The card is mounted with udisksctl when it is not already mounted, then
-# exposed as dosdevices/<letter>: (mountpoint) and <letter>:: (raw device).
-# Wine is told that drive is removable. A log is appended to
-# ~/.cache/gadm-launch.log.
+# exposed as dosdevices/<letter>: (the mountpoint). A: and B: do not get a
+# <letter>:: raw-device symlink; that made mountmgr treat the drive oddly.
+# The floppy registry value is written, then wineserver is stopped so the
+# next start reads it. A log is appended to ~/.cache/gadm-launch.log.
 #
 # Dialogs use kdialog (KDE). On GNOME, install the kdialog package.
 
@@ -21,7 +29,8 @@ fi
 set -u
 
 export WINEPREFIX="${WINEPREFIX:-${HOME}/garmin-gadm}"
-GADM_DRIVE="${GADM_DRIVE:-g}"
+# A: (or B:) is required. See the header comment: later letters are not removable.
+GADM_DRIVE="${GADM_DRIVE:-a}"
 LETTER="${GADM_DRIVE,,}"
 APP_DIR="${WINEPREFIX}/drive_c/Program Files (x86)/Garmin/Garmin Aviation Database Manager"
 EXE="Garmin Aviation Database Manager.exe"
@@ -47,13 +56,14 @@ if [[ ! "${LETTER}" =~ ^[a-z]$ ]]; then
   die_dialog "GADM_DRIVE must be a single letter a-z (got: ${GADM_DRIVE})."
 fi
 if [[ "${LETTER}" == "c" || "${LETTER}" == "z" ]]; then
-  die_dialog "GADM_DRIVE=${LETTER} is reserved by Wine. C: is the Windows system drive and Z: is the Linux filesystem. Pick another letter (the default is G:)."
+  die_dialog "GADM_DRIVE=${LETTER} is reserved by Wine. C: is the Windows system drive and Z: is the Linux filesystem. Leave GADM_DRIVE unset to use A:."
 fi
 
 missing=()
 command -v kdialog >/dev/null 2>&1 || missing+=("kdialog")
 command -v udisksctl >/dev/null 2>&1 || missing+=("udisksctl")
 command -v wine >/dev/null 2>&1 || missing+=("wine")
+command -v wineserver >/dev/null 2>&1 || missing+=("wineserver")
 command -v lsblk >/dev/null 2>&1 || missing+=("lsblk")
 if ((${#missing[@]} > 0)); then
   printf 'Missing required program(s): %s\n' "${missing[*]}" >&2
@@ -62,6 +72,15 @@ if ((${#missing[@]} > 0)); then
 fi
 
 DRIVE_LABEL="${LETTER^^}:"
+
+# mountmgr only reports DRIVE_REMOVABLE for A: and B:. Warn and continue so
+# the log shows why a custom letter was ignored.
+if [[ "${LETTER}" != "a" && "${LETTER}" != "b" ]]; then
+  drive_warn="GADM only detects A: and B: as removable drives. Wine reports ${DRIVE_LABEL} as a fixed disk, so Database Manager will ignore it. Unset GADM_DRIVE to use A:."
+  echo "${drive_warn}" >&2
+  log "warning: ${drive_warn}"
+  kdialog --title "Garmin Database Manager" --sorry "${drive_warn}" || true
+fi
 
 # Print one lsblk -P field. lsblk hex-escapes unsafe bytes as \xNN.
 lsblk_field() {
@@ -140,7 +159,7 @@ if [[ -n "${CARD}" ]]; then
   SIZE="${SIZE:-unknown}"
   kdialog --title "Garmin Database Manager" \
     --yes-label "Start" --no-label "Cancel" \
-    --yesno "SD card connected (${SIZE}, ${DEV}).\n\nIt will show up as drive ${DRIVE_LABEL} in Database Manager.\n\nStart now?" || exit 0
+    --yesno "SD card connected (${SIZE}, ${DEV}).\n\nIt will show up as drive ${DRIVE_LABEL} in Database Manager.\n\nWine may also auto-detect the same card as another letter (often H:). That extra drive can be ignored.\n\nStart now?" || exit 0
 fi
 
 link_path() {
@@ -157,9 +176,23 @@ link_path "${WINEPREFIX}/dosdevices/${LETTER}::"
 
 if [[ -n "${CARD}" ]]; then
   ln -s "${MNT}" "${WINEPREFIX}/dosdevices/${LETTER}:"
-  ln -s "${DEV}" "${WINEPREFIX}/dosdevices/${LETTER}::"
-  # "floppy" is Wine's drive type for removable media (DRIVE_REMOVABLE).
-  wine reg add 'HKLM\Software\Wine\Drives' /v "${LETTER}:" /d floppy /f >>"${LOG}" 2>&1 || true
+  # A: and B: stay a mountpoint symlink only. A <letter>:: link to the raw
+  # device made mountmgr treat the drive oddly, and a non-root user cannot
+  # read /dev/sdX anyway.
+  if [[ "${LETTER}" != "a" && "${LETTER}" != "b" ]]; then
+    ln -s "${DEV}" "${WINEPREFIX}/dosdevices/${LETTER}::"
+  fi
+  # Write floppy before mountmgr starts. "wine reg add" itself starts
+  # wineserver, which would cache the previous drive table, so stop it and
+  # wait until it is gone. The app launch below starts a fresh one.
+  if wine reg add 'HKLM\Software\Wine\Drives' /v "${LETTER}:" /d floppy /f >>"${LOG}" 2>&1; then
+    log "set ${DRIVE_LABEL} type to floppy"
+  else
+    log "warning: could not set ${DRIVE_LABEL} to floppy in the Wine registry"
+  fi
+  log "restarting wineserver so mountmgr reloads drive types"
+  wineserver -k >>"${LOG}" 2>&1 || true
+  wineserver -w >>"${LOG}" 2>&1 || true
   log "card ${DEV} at ${MNT} mapped to ${DRIVE_LABEL}"
 else
   log "starting without an SD card; ${DRIVE_LABEL} left unmapped"
