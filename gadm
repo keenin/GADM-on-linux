@@ -29,6 +29,10 @@ fi
 set -u
 
 export WINEPREFIX="${WINEPREFIX:-${HOME}/garmin-gadm}"
+# During an in-app update the GADM installer asks Wine to rebuild the desktop
+# menu. That replaces this launcher's Exec line, so the menu shortcut no longer
+# mounts the card. Disable winemenubuilder for this process and its children.
+export WINEDLLOVERRIDES="winemenubuilder.exe=d"
 # A: (or B:) is required. See the header comment: later letters are not removable.
 GADM_DRIVE="${GADM_DRIVE:-a}"
 LETTER="${GADM_DRIVE,,}"

@@ -127,6 +127,7 @@ That script:
 - copies `gadm` to `~/.local/bin/gadm`
 - writes `~/.local/share/applications/gadm.desktop`, with `@HOME@` replaced by your home directory (a `.desktop` `Exec` line does not expand `~`)
 - runs `update-desktop-database` and, when it exists, `kbuildsycoca6`, so the menu picks up the new entry
+- installs the PowerShell shim into the Wine prefix (see [In-app updates](#in-app-updates))
 - checks that `wine`, `udisksctl`, and `kdialog` are on `PATH`, and prints the apt command above if one is missing
 
 The menu name is **Garmin Aviation Database Manager**. The icon is the theme's removable-drive icon.
@@ -144,6 +145,52 @@ Log out and back in if a terminal cannot find `gadm`. Many desktops add `~/.loca
 If the card is not in the reader yet, the **No SD card found** dialog can **Try again** after you insert it, or **Open without card** when you only need the app itself (account, calendar, downloads). Cancel closes the launcher and does not start Wine.
 
 `udisksctl` mounts the card as your desktop user. Start the launcher from the menu in a local graphical session. A mount from an SSH session is often denied by polkit; the denial is written to the log.
+
+## In-app updates
+
+GADM 26.7.14 can update itself. It is a 32-bit Electron app. The new installer is downloaded to:
+
+```text
+C:\users\<user>\AppData\Local\Garmin Aviation Database Manager\Downloads\.garmin_aviation_database_manager_app_upgrades\garminAvnDbManagerSetup_<version>.exe
+```
+
+`application-upgrader-windows.js` then starts that installer with:
+
+```text
+powershell.exe Start-Process -FilePath "<installer>" -Verb Runas
+```
+
+Wine ships `powershell.exe` as a stub, so the command returns without running anything and the update never starts.
+
+`install.sh` replaces that stub. The shim handles `Start-Process -FilePath X [-ArgumentList Y] [-Verb ...]`: it calls `ShellExecuteExW` with the verb `open` on `X`, so the Garmin installer window opens when you click install in Database Manager. `-Verb Runas` is not a Windows UAC prompt under Wine; the installer just opens. Any other PowerShell command line is forwarded to Wine's original binary, kept beside the shim as `powershell-wine.exe`. Each call is appended to `%TEMP%\powershell-shim.log` in the prefix. That file is usually:
+
+```text
+~/garmin-gadm/drive_c/users/<name>/Temp/powershell-shim.log
+```
+
+`wine cmd /c echo %TEMP%` prints the path if it is somewhere else.
+
+GADM is 32-bit, so the copy it runs is:
+
+```text
+~/garmin-gadm/drive_c/windows/syswow64/WindowsPowerShell/v1.0/powershell.exe
+```
+
+`install.sh` also installs a 64-bit copy under `drive_c/windows/system32/WindowsPowerShell/v1.0/` for anything else in the prefix. The first run copies the existing `powershell.exe` to `powershell-wine.exe` and will not overwrite that backup. If either WindowsPowerShell directory is missing, the script warns and skips it; create the prefix with `wineboot --init` and run `install.sh` again.
+
+The launcher sets `WINEDLLOVERRIDES=winemenubuilder.exe=d` before it starts Wine. Without that, the GADM installer tells Wine to rebuild the application menu, and the menu entry stops running `gadm`. The next launch from the menu then no longer mounts the card.
+
+To roll the shim back, run `./uninstall.sh`. It copies `powershell-wine.exe` back over `powershell.exe` in both folders and leaves the backup file in place. By hand:
+
+```bash
+prefix="$HOME/garmin-gadm"
+for folder in syswow64 system32; do
+  dir="$prefix/drive_c/windows/$folder/WindowsPowerShell/v1.0"
+  cp -a "$dir/powershell-wine.exe" "$dir/powershell.exe"
+done
+```
+
+The prebuilt shims are `powershell-shim/powershell32.exe` and `powershell-shim/powershell64.exe`. `powershell-shim/build.sh` rebuilds them with mingw-w64, or with zig (`python3 -m ziglang cc`) when mingw is not installed.
 
 ## Environment variables
 
@@ -285,6 +332,29 @@ udisksctl power-off -b /dev/sdb1
 
 Use the device node from the start dialog or from the log, not a guess.
 
+### An in-app update does nothing
+
+Database Manager downloads the installer and then sits there. Wine's PowerShell stub is still what GADM is running, or the shim failed to launch the file.
+
+Re-run `./install.sh`. Then check the 32-bit folder, which is the one GADM uses:
+
+```bash
+ls -l "$WINEPREFIX/drive_c/windows/syswow64/WindowsPowerShell/v1.0/powershell.exe" \
+      "$WINEPREFIX/drive_c/windows/syswow64/WindowsPowerShell/v1.0/powershell-wine.exe"
+```
+
+`powershell-wine.exe` is Wine's original. `powershell.exe` is the shim from this repository. Click install in Database Manager again and read `%TEMP%\powershell-shim.log`. A line ending in `-> launched` means the installer was started. `-> FAILED` means `ShellExecuteExW` rejected the path. If `install.sh` warned that `WindowsPowerShell/v1.0` did not exist, run `WINEPREFIX="$HOME/garmin-gadm" wineboot --init` and then `./install.sh` again.
+
+### The menu shortcut stops mounting the card after an update
+
+The GADM installer asked Wine to regenerate the desktop entry, so the menu item no longer runs `gadm` and the card is never mounted. Check the command:
+
+```bash
+grep '^Exec=' ~/.local/share/applications/gadm.desktop
+```
+
+That line should be the full path of `~/.local/bin/gadm`. If it starts with `wine`, or a second Garmin entry has appeared, run `./install.sh` again. It rewrites the menu entry. The launcher sets `WINEDLLOVERRIDES=winemenubuilder.exe=d` so a later in-app update does not rebuild that entry. Remove any extra Garmin menu item whose `Exec` line is `wine` rather than `gadm`.
+
 ### Wine problems
 
 Launcher output, Wine output, and the `reg add` that marks the drive removable all go to `~/.cache/gadm-launch.log`. Scroll to the latest timestamp.
@@ -303,6 +373,10 @@ ls -l "$WINEPREFIX/dosdevices/a:"
 | --- | --- |
 | `gadm` | Launcher script |
 | `gadm.desktop` | Menu entry template (`@HOME@` is replaced by `install.sh`) |
-| `install.sh` | Installs the script and menu entry, then checks dependencies |
-| `uninstall.sh` | Removes the script and menu entry |
+| `install.sh` | Installs the script, menu entry, and PowerShell shim, then checks dependencies |
+| `uninstall.sh` | Removes the script and menu entry, and restores Wine's `powershell.exe` |
+| `powershell-shim/powershell-shim.c` | Source for the `Start-Process` shim |
+| `powershell-shim/build.sh` | Cross-compiles the 32-bit and 64-bit shims |
+| `powershell-shim/powershell32.exe` | 32-bit shim, installed into `syswow64` (the one GADM uses) |
+| `powershell-shim/powershell64.exe` | 64-bit shim, installed into `system32` |
 | `README.md` | This guide |
